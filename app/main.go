@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	// Available if you need it!
-	// "github.com/xwb1989/sqlparser"
 )
 
 // Usage: your_sqlite3.sh sample.db .dbinfo
@@ -23,42 +21,69 @@ func main() {
 		}
 		defer databaseFile.Close()
 
-		header := make([]byte, 100)
-
-		_, err = databaseFile.Read(header)
+		header, err := ReadDatafileHeader(databaseFile)
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		var headerPageSize uint16
-		if err := binary.Read(bytes.NewReader(header[16:18]), binary.BigEndian, &headerPageSize); err != nil {
-			fmt.Println("Failed to read integer:", err)
-			return
-		}
-		var pageSize uint32
-		if headerPageSize == 1 {
-			pageSize = 65536
-		} else {
-			pageSize = uint32(headerPageSize)
-		}
 		// read the first page
-		rootPage := make([]byte, pageSize)
+		rootPage := make([]byte, header.pageSize)
 
-		_, err = databaseFile.Read(rootPage)
+		_, err = databaseFile.ReadAt(rootPage, 0)
 		if err != nil {
 			log.Fatal(err)
 		}
 
-		var numTables uint16
-		if err := binary.Read(bytes.NewReader(rootPage[3:5]), binary.BigEndian, &numTables); err != nil {
-			fmt.Println("Failed to read integer:", err)
-			return
+		// For the first page, offset calculations must consider the database header
+		pageOffset := 100 // Database header offset for the first page
+
+		var pageType = rootPage[pageOffset]
+		if pageType != 0x0D {
+			log.Fatal("Root page is not a table b-tree page")
+		}
+		// Leaf Table B-Tree Page
+		leafTableHeader := LeafTableHeader{
+			FirstFreeblock:              binary.BigEndian.Uint16(rootPage[1+pageOffset : 3+pageOffset]),
+			NumCells:                    binary.BigEndian.Uint16(rootPage[3+pageOffset : 5+pageOffset]),
+			StartOfCellContentArea:      binary.BigEndian.Uint16(rootPage[5+pageOffset : 7+pageOffset]),
+			NumberofFragmentedFreeBytes: rootPage[7+pageOffset],
 		}
 
-		fmt.Printf("database page size: %v", pageSize)
-		fmt.Printf("number of tables: %v", numTables)
+		cellPointerArray := make([]uint16, leafTableHeader.NumCells)
+		for i := 0; i < int(leafTableHeader.NumCells); i++ {
+			cellPointerArray[i] = binary.BigEndian.Uint16(rootPage[8+pageOffset+i*2 : 10+pageOffset+i*2])
+		}
+
+		var payloads [][]byte
+		for _, pointer := range cellPointerArray {
+			ptrOffset := int(pointer)
+			payloadSize, payloadSizeLen := binary.Uvarint(rootPage[ptrOffset:])
+			_, rowidLen := binary.Uvarint(rootPage[ptrOffset+payloadSizeLen:])
+
+			payloads = append(payloads, rootPage[ptrOffset+payloadSizeLen+rowidLen:ptrOffset+int(payloadSize)])
+
+		}
+
+		var numTables uint32
+		tableSignature := []byte("table")
+		for _, payload := range payloads {
+			if bytes.Contains(payload, tableSignature) {
+				numTables++
+			}
+		}
+
+		fmt.Printf("database page size: %v\n", header.pageSize)
+		fmt.Println("number of cells in the root page: ", leafTableHeader.NumCells)
+		fmt.Printf("number of tables: %v\n", numTables)
 	default:
 		fmt.Println("Unknown command", command)
 		os.Exit(1)
 	}
+}
+
+type LeafTableHeader struct {
+	FirstFreeblock              uint16
+	NumCells                    uint16
+	StartOfCellContentArea      uint16
+	NumberofFragmentedFreeBytes uint8
 }
